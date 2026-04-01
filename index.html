@@ -2993,12 +2993,162 @@ function deductStockFromCart(cartItems){
   saveProds();
 }
 
+
+// ══════════════════════════════════════════════════════════════
+// ══ SUPABASE — SINCRONIZAÇÃO EM TEMPO REAL ════════════════════
+// ══════════════════════════════════════════════════════════════
+// Configure aqui após criar sua conta no Supabase (supabase.com):
+const SUPABASE_URL = '';        // ex: https://abcxyz.supabase.co
+const SUPABASE_ANON_KEY = '';   // sua chave anon/public
+const SYNC_ENABLED = !!(SUPABASE_URL && SUPABASE_ANON_KEY);
+
+// Cliente Supabase leve (sem dependência externa)
+const SB = SYNC_ENABLED ? {
+  _h: {'apikey': SUPABASE_ANON_KEY, 'Authorization': 'Bearer '+SUPABASE_ANON_KEY, 'Content-Type': 'application/json', 'Prefer': 'return=representation'},
+  async get(table, key){
+    try{
+      const r=await fetch(`${SUPABASE_URL}/rest/v1/${table}?key=eq.${encodeURIComponent(key)}&select=value`,{headers:this._h});
+      if(!r.ok)return null;
+      const d=await r.json();
+      return d[0]?JSON.parse(d[0].value):null;
+    }catch(e){console.warn('[SB] get error',e);return null;}
+  },
+  async set(table, key, value){
+    try{
+      const body=JSON.stringify({key,value:JSON.stringify(value),updated_at:new Date().toISOString()});
+      await fetch(`${SUPABASE_URL}/rest/v1/${table}`,{method:'POST',headers:{...this._h,'Prefer':'resolution=merge-duplicates'},body});
+    }catch(e){console.warn('[SB] set error',e);}
+  },
+  async getAll(table){
+    try{
+      const r=await fetch(`${SUPABASE_URL}/rest/v1/${table}?select=key,value`,{headers:this._h});
+      if(!r.ok)return{};
+      const d=await r.json();
+      const out={};
+      d.forEach(row=>{try{out[row.key]=JSON.parse(row.value);}catch(e){}});
+      return out;
+    }catch(e){console.warn('[SB] getAll error',e);return{};}
+  },
+  // Realtime subscription
+  subscribe(table, callback){
+    const ws_url=SUPABASE_URL.replace('https://','wss://').replace('http://','ws://')+'/realtime/v1/websocket?vsn=1.0.0&apikey='+SUPABASE_ANON_KEY;
+    let ws;
+    function connect(){
+      ws=new WebSocket(ws_url);
+      ws.onopen=()=>{
+        ws.send(JSON.stringify({topic:`realtime:public:${table}`,event:'phx_join',payload:{},ref:1}));
+      };
+      ws.onmessage=(e)=>{
+        const msg=JSON.parse(e.data);
+        if(msg.event==='postgres_changes'||msg.topic?.includes(table))callback(msg);
+      };
+      ws.onclose=()=>setTimeout(connect,3000); // reconnect
+      ws.onerror=(e)=>console.warn('[SB] WS error',e);
+    }
+    connect();
+    return ()=>ws&&ws.close();
+  }
+} : null;
+
+// CHAVES DE SINCRONIZAÇÃO
+const SYNC_TABLES = {
+  store_data: ['lb_st','lb_menus','lb_cats','lb_subcats','lb_submenus',
+               'lb_fretes','lb_payments','lb_dyn_costs','lb_dyn_taxes',
+               'lb_combos','lb_upsell','lb_wa_templates','lb_coupons',
+               'lb_carts','lb_sales','lb_avises','lb_trocas','lb_desejos',
+               'lb_meta','lb_dash_inputs'],
+  products: ['lb_prods'],
+};
+
+// PUSH: salva no Supabase quando localStorage muda
+async function syncPush(key, value){
+  if(!SYNC_ENABLED)return;
+  const table=SYNC_TABLES.products.includes(key)?'products':'store_data';
+  await SB.set(table, key, value);
+}
+
+// PULL: carrega tudo do Supabase na inicialização
+async function syncPullAll(){
+  if(!SYNC_ENABLED)return false;
+  console.log('[SYNC] Carregando dados do Supabase...');
+  try{
+    const [storeData, prodData]=await Promise.all([
+      SB.getAll('store_data'),
+      SB.getAll('products'),
+    ]);
+    const allData={...storeData,...prodData};
+    let loaded=0;
+    Object.entries(allData).forEach(([key,value])=>{
+      if(value!==null&&value!==undefined){
+        localStorage.setItem(key,JSON.stringify(value));
+        loaded++;
+      }
+    });
+    console.log(`[SYNC] ${loaded} chaves carregadas do Supabase`);
+    return loaded>0;
+  }catch(e){
+    console.warn('[SYNC] Erro ao carregar do Supabase:',e);
+    return false;
+  }
+}
+
+// REALTIME: atualiza automaticamente quando outro dispositivo muda dados
+function syncStartRealtime(){
+  if(!SYNC_ENABLED||!SB.subscribe)return;
+  ['store_data','products'].forEach(table=>{
+    SB.subscribe(table,(msg)=>{
+      if(msg.payload?.data){
+        const row=msg.payload.data.record||msg.payload.data;
+        if(row?.key&&row?.value){
+          try{
+            const val=typeof row.value==='string'?JSON.parse(row.value):row.value;
+            localStorage.setItem(row.key,JSON.stringify(val));
+            // Recarrega dados em memória
+            applyRealtimeUpdate(row.key, val);
+          }catch(e){}
+        }
+      }
+    });
+  });
+  console.log('[SYNC] Realtime ativo — atualizações em tempo real habilitadas');
+}
+
+// Aplica atualização em tempo real sem recarregar a página
+function applyRealtimeUpdate(key, val){
+  try{
+    if(key==='lb_prods'){products=val.map?.(p=>({...p}));if(document.getElementById('catGrid'))renderGrid();}
+    else if(key==='lb_sales'){salesData=val||[];}
+    else if(key==='lb_carts'){savedCarts=val||[];}
+    else if(key==='lb_st'){settings={...DS,...val};applySt();}
+    else if(key==='lb_payments'){paymentMethods=val||[];populatePaySelects();}
+    else if(key==='lb_fretes'){freteOptions=val||[];}
+    // Atualiza UI do admin se estiver aberto
+    if(document.getElementById('ap')?.classList.contains('open')){
+      if(['lb_sales','lb_carts'].includes(key)){renderSalesTable();renderDash();}
+      if(key==='lb_prods'){populateACBSelect();renderUpsellAdmin();}
+    }
+    console.log('[SYNC] Dado atualizado em tempo real:',key);
+  }catch(e){console.warn('[SYNC] Erro ao aplicar update:',e);}
+}
+
+// STATUS DE SINCRONIZAÇÃO
+function showSyncStatus(msg, color){
+  let el=document.getElementById('syncStatus');
+  if(!el){el=document.createElement('div');el.id='syncStatus';Object.assign(el.style,{position:'fixed',bottom:'5.5rem',left:'50%',transform:'translateX(-50%)',background:color||'#1c1c1c',color:'#fff',padding:'.3rem .9rem',fontSize:'.65rem',borderRadius:'2px',zIndex:'9999',fontFamily:'DM Sans,sans-serif',transition:'opacity .3s',pointerEvents:'none'});document.body.appendChild(el);}
+  el.style.background=color||'#1c1c1c';el.textContent=msg;el.style.opacity='1';
+  clearTimeout(el._t);el._t=setTimeout(()=>el.style.opacity='0',3000);
+}
+// ══════════════════════════════════════════════════════════════
+
 // ══════════════════════════════════════════════
 // SETTINGS
 // ══════════════════════════════════════════════
 const DS={brand:'Achadinhos Perky',sub:'Últimos dias',btnText:'Ver catálogo',headerBrand:'Achadinhos Perky',pageTitle:'Catálogo',phone:'555186241434',msgIntro:'Olá! Sou {nome} e gostaria de garantir alguns itens:',promoTag:'Promo',freteFreeMin:399,freteInfo:'Frete grátis para compras a partir de R$ 399',password:'1234',aviseActive:true,stockWarnQty:3,stockWarnText:'Últimas {n} unidades!'};
 function loadSt(){try{const s=localStorage.getItem('lb_st');return s?{...DS,...JSON.parse(s)}:{...DS};}catch(e){return{...DS};}}
-function saveSt(){try{localStorage.setItem('lb_st',JSON.stringify(settings));}catch(e){}}
+function saveSt(){
+  try{localStorage.setItem('lb_st',JSON.stringify(settings));}catch(e){}
+  syncPush('lb_st',settings);
+}
 let settings=loadSt();
 function applySt(){document.getElementById('wBrand').textContent=settings.brand;document.getElementById('wSub').textContent=settings.sub;document.getElementById('wBtn').textContent=settings.btnText;document.getElementById('headerBrand').textContent=settings.headerBrand;document.getElementById('pageTitle').textContent=settings.pageTitle;document.title=settings.pageTitle;}
 applySt();
@@ -3197,13 +3347,18 @@ function renderPaymentAdmin(){
           </label>
         </div>
       </div>
-      ${(p.installments||1)>1?`
-      <div class="installment-rates">
-        <div style="font-size:.67rem;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--mt);margin-bottom:.4rem">Taxas internas por parcela</div>
-        <label style="display:flex;align-items:center;gap:.45rem;font-size:.76rem;cursor:pointer;margin-bottom:.6rem;padding:.4rem;background:#fdf3e7;border:1px solid var(--acl);border-radius:2px">
+      <div class="installment-rates" style="margin-top:.5rem">
+        <div style="font-size:.67rem;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--mt);margin-bottom:.4rem">Taxas internas (custo seu — apenas para o Dashboard)</div>
+        ${(p.installments||1)>1?`<label style="display:flex;align-items:center;gap:.45rem;font-size:.76rem;cursor:pointer;margin-bottom:.6rem;padding:.4rem;background:#fdf3e7;border:1px solid var(--acl);border-radius:2px">
           <input type="checkbox" ${p.repassarTaxa?'checked':''} onchange="updatePayment(${i},'repassarTaxa',this.checked)" style="width:16px;height:16px">
-          <span><strong>Repassar taxa ao cliente</strong> — se marcado, o cliente vê o valor com juros; se desmarcado, o cliente vê sempre "sem juros" e o custo fica só no seu dashboard</span>
-        </label>
+          <span><strong>Repassar juros ao cliente</strong> — se marcado, o cliente vê o valor com juros nas parcelas; se desmarcado, sempre "sem juros" para o cliente</span>
+        </label>`:''}
+        <div class="inst-row">
+          <span style="min-width:28px;color:var(--mt);font-size:.72rem">1x</span>
+          <input type="number" value="${(p.rates&&p.rates[1]!==undefined)?p.rates[1]:(p.taxPct||0)}" step="0.01" placeholder="%" onchange="updatePaymentRate(${i},1,this.value)" style="width:70px">
+          <span style="font-size:.68rem;color:var(--mt)">%</span>
+          <span style="font-size:.65rem;color:var(--mt)">= taxa à vista (Pix, débito, dinheiro: 0%)</span>
+        </div>
         ${Array.from({length:p.installments||1},(_,n)=>n+1).filter(n=>n>1).map(n=>`
         <div class="inst-row">
           <span style="min-width:28px;color:var(--mt);font-size:.72rem">${n}x</span>
@@ -3212,9 +3367,9 @@ function renderPaymentAdmin(){
           <span style="font-size:.65rem;color:var(--mt)">= custo seu por parcela</span>
         </div>`).join('')}
         <div style="font-size:.65rem;color:var(--mt);margin-top:.35rem;padding:.3rem;background:#f0f8ff;border-left:2px solid var(--blue)">
-          📊 As taxas acima ficam <strong>visíveis apenas no Dashboard</strong> → seção "Por forma de pagamento" mostra o custo real de cada venda parcelada.
+          📊 Taxas visíveis <strong>só no Dashboard</strong> → "Por pagamento" mostra custo real de cada venda.
         </div>
-      </div>`:``}
+      </div>
       <button class="btn-sm" style="background:var(--rd);margin-top:.5rem" onclick="deletePayment(${i})">Excluir</button>
     </div>`).join('');
 }
@@ -3305,9 +3460,16 @@ function renderUpsellAdmin(){
   el.innerHTML=upsellIds.map((id,i)=>{
     const p=products.find(x=>x.id===id);
     if(!p)return '';
-    return `<div class="menu-row"><img src="${p.img||PH}" style="width:36px;height:36px;object-fit:cover"><span style="flex:1;font-size:.78rem">${p.cat} - ${p.name} (Tam. ${p.size})</span><button onclick="removeUpsell(${i})">Remover</button></div>`;
-  }).join('')||'<div class="es">Nenhum produto configurado.</div>';
+    return `<div class="menu-row"><img src="${p.img||PH}" style="width:36px;height:36px;object-fit:cover;border:1px solid var(--br)"><span style="flex:1;font-size:.78rem">${p.cat} — ${p.name} Tam.${p.size}</span><span style="font-size:.62rem;color:${p.stock>0?'var(--gn)':'var(--rd)'};margin-right:.5rem">Est:${p.stock}</span><button onclick="removeUpsell(${i})">Remover</button></div>`;
+  }).join('')||'<div class="es" style="font-size:.76rem">Nenhum produto configurado. Se vazio, o carrinho mostra produtos aleatórios disponíveis.</div>';
   populateUpsellSelect();
+}
+function populateUpsellSelect(){
+  const s=document.getElementById('upsellAddSel');if(!s)return;
+  s.innerHTML='<option value="">— Selecionar produto para adicionar —</option>'+
+    products.filter(p=>!upsellIds.includes(p.id)).sort((a,b)=>a.cat.localeCompare(b.cat)).map(p=>
+      `<option value="${p.id}">${p.cat} — ${p.name} Tam.${p.size} (Est:${p.stock})</option>`
+    ).join('');
 }
 function addUpsellProduct(){
   const id=prompt('Cole o ID do produto (ex: p19, b2):');
@@ -3317,10 +3479,7 @@ function addUpsellProduct(){
   if(upsellIds.includes(p.id)){toast('Já está na lista!');return;}
   upsellIds.push(p.id);saveUpsell();renderUpsellAdmin();toast('Produto adicionado ao upsell!');
 }
-function populateUpsellSelect(){
-  const s=document.getElementById('upsellAddSel');if(!s)return;
-  s.innerHTML='<option value="">— Selecionar produto —</option>'+products.filter(p=>p.stock>0&&!upsellIds.includes(p.id)).map(p=>`<option value="${p.id}">${p.cat} ${p.name} Tam.${p.size}</option>`).join('');
-}
+// populateUpsellSelect moved inside renderUpsellAdmin
 function upsellAddFromSelect(){
   const id=document.getElementById('upsellAddSel')?.value;if(!id)return;
   if(upsellIds.includes(id)){toast('Já está na lista!');return;}
@@ -3530,14 +3689,20 @@ function loadProds(){
   }catch(e){}
   return DP.map(p=>({...p,cost:p.cost||0,subcat:p.subcat||''}));
 }
-function saveProds(){try{localStorage.setItem('lb_prods',JSON.stringify(products));}catch(e){}}
+function saveProds(){
+  try{localStorage.setItem('lb_prods',JSON.stringify(products));}catch(e){}
+  syncPush('lb_prods',products);
+}
 let products=loadProds();
 
 // ══════════════════════════════════════════════
 // CARTS / SALES / COUPONS
 // ══════════════════════════════════════════════
 function loadLS(key,def){try{const s=localStorage.getItem(key);return s?JSON.parse(s):def;}catch(e){return def;}}
-function saveLS(key,val){try{localStorage.setItem(key,JSON.stringify(val));}catch(e){}}
+function saveLS(key,val){
+  try{localStorage.setItem(key,JSON.stringify(val));}catch(e){}
+  syncPush(key,val); // sincroniza com Supabase se configurado
+}
 let savedCarts=loadLS('lb_carts',[]);
 let salesData=loadLS('lb_sales',[]);
 let coupons=loadLS('lb_coupons',[]);
@@ -3596,7 +3761,7 @@ function openAdminPanel(){
   renderCostItems();renderTaxItems();
   fillCheckoutSettingsForm();fillPixSettingsForm();
   renderCouponList();renderCartList();renderSalesTable();renderDash();
-  populateDashGroupFilter();renderWATemplateAdmin();renderUpsellAdmin();populateUpsellSelect();
+  populateDashGroupFilter();renderWATemplateAdmin();renderUpsellAdmin();
   renderClientesTab();renderTrocasTab();renderFavsAdmin();applyCheckoutSettings();
 }
 function closeAdminPanel(){document.getElementById('ap').classList.remove('open');}
@@ -4267,22 +4432,23 @@ function selectPay(id){
   const parRow=document.getElementById('parcelaRow');
   const pixInfo=document.getElementById('pixInfo');
   if(pm&&pm.installments>1){
-    const cartSub=cart.reduce((s,ci)=>{const p=products.find(x=>x.id===ci.id);return s+(p?p.price*ci.qty:0);},0);
-    const minParc=pm.minParcelaValue||10;
-    const maxN=Math.min(pm.installments,Math.floor(cartSub/minParc));
+    // usa total real com todos os descontos de promo para calcular parcelas
+    const {total:cartTotal2,sub:cartSub2}=getCartTotals();
+    const baseParc=cartTotal2>0?cartTotal2:cartSub2;
+    const minParc=parseFloat(pm.minParcelaValue)||10;
+    const maxN=Math.min(pm.installments,Math.floor(baseParc/minParc));
     if(maxN>1){
       parRow.classList.add('show');
       const sel=document.getElementById('parcelasSel');
-      sel.innerHTML=Array.from({length:maxN},(_,i)=>{
-        const n=i+2;
+      sel.innerHTML=Array.from({length:maxN-1},(_,i)=>{
+        const n=i+2; // começa em 2x até maxN x
         // Taxa real (para cálculo interno)
         let taxaReal=0;
         if(pm.rates&&pm.rates[n]!==undefined)taxaReal=parseFloat(pm.rates[n])||0;
         else taxaReal=parseFloat(pm.taxPct)||0;
         // Taxa ao cliente: 0 se não repassar, taxaReal se repassar
         const taxaCliente=pm.repassarTaxa?taxaReal:0;
-        const {total:totalAtual}=getCartTotals();
-        const valorParc=totalAtual*(1+taxaCliente/100)/n;
+        const valorParc=baseParc*(1+taxaCliente/100)/n;
         const label=taxaCliente===0?' sem juros':` c/ ${taxaCliente.toFixed(1)}% a.m.`;
         return `<option value="${n}">${n}x de R$ ${valorParc.toFixed(2).replace('.',',')}${label}</option>`;
       }).join('');
@@ -4571,19 +4737,17 @@ function renderDash(){
   const ticketMed=data.length?totalRev/data.length:0;
   const ticketMedCliente=clients.length?totalRev/clients.length:0;
 
-  // Taxas de pagamento (usa taxas REAIS cadastradas — independente de repassar ao cliente)
+  // Taxas de pagamento — inclui 1x (taxa à vista do Pix, débito, etc.)
   let totalTaxes=0;
   paymentMethods.forEach(pm=>{
     const pmSales=data.filter(s=>s.pay&&s.pay.startsWith(pm.id));
     pmSales.forEach(sale=>{
-      // Detecta número de parcelas da venda (ex: 'cartao_3x' → 3)
       const match=sale.pay?.match(/_(\d+)x$/);
-      const n=match?parseInt(match[1]):1;
+      const n=match?parseInt(match[1]):1; // 1x para vendas sem parcela
       let taxaReal=0;
-      if(n>1){
-        if(pm.rates&&pm.rates[n]!==undefined)taxaReal=parseFloat(pm.rates[n])||0;
-        else taxaReal=parseFloat(pm.taxPct)||0;
-      }
+      if(pm.rates&&pm.rates[n]!==undefined)taxaReal=parseFloat(pm.rates[n])||0;
+      else if(n>1)taxaReal=parseFloat(pm.taxPct)||0;
+      // taxa 1x: só se cadastrada em rates[1]
       totalTaxes+=(sale.totalFinal||0)*taxaReal/100;
     });
   });
@@ -4725,7 +4889,34 @@ document.querySelectorAll('.mo').forEach(o=>o.addEventListener('click',e=>{
 // ══════════════════════════════════════════════
 // INIT
 // ══════════════════════════════════════════════
-document.addEventListener('DOMContentLoaded',()=>{
+document.addEventListener('DOMContentLoaded',async ()=>{
+  // Carrega dados do Supabase (se configurado) antes de inicializar
+  if(SYNC_ENABLED){
+    showSyncStatus('🔄 Sincronizando dados...','#2980b9');
+    const loaded=await syncPullAll();
+    if(loaded){
+      // Reinicia variáveis com dados do Supabase
+      settings=loadSt();
+      paymentMethods=loadPayments();
+      freteOptions=loadFretes();
+      menus=loadMenus();
+      categories=loadCats();
+      submenus=loadSubmenus();
+      dynCosts=loadDynCosts();
+      dynTaxes=loadDynTaxes();
+      combos=loadCombos();
+      upsellIds=loadUpsell();
+      products=loadProds();
+      salesData=loadLS('lb_sales',[]);
+      savedCarts=loadLS('lb_carts',[]);
+      coupons=loadLS('lb_coupons',[]);
+      aviseList_data=loadAvises();
+      trocas=loadTrocas();
+      desejos=loadDesejos();
+      showSyncStatus('✅ Dados sincronizados!','#27ae60');
+    }
+    syncStartRealtime();
+  }
   populatePaySelects();populateCatSelects();
   document.getElementById('dashInvest').value=dashInputs.invest||0;
   document.getElementById('dashSessoes').value=dashInputs.sessoes||0;
